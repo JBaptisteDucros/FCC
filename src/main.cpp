@@ -1,8 +1,8 @@
-// FCC - Falcon Cockpit Camera
+// SFC - Simple Falcon Camera
 // Plugin X-Plane 12 : sauvegarde / rappelle des positions de camera (tete du pilote
 // en vue cockpit 3D) avec un raccourci clavier par position.
 //
-// Installation : Aircraft/<Falcon 8X>/plugins/FCC/64/win.xpl (lin.xpl / mac.xpl)
+// Installation : Aircraft/<Falcon 8X>/plugins/SFC/64/win.xpl (lin.xpl / mac.xpl)
 
 #include <cstdio>
 #include <cstring>
@@ -49,6 +49,7 @@ struct Slot {
     std::string name;
     int vk = 0;               // 0 = pas de keybind
     int kflags = 0;           // modificateurs (Shift / Ctrl / Alt)
+    bool enabled = true;      // keybind actif ou desactive (sans etre supprime)
     bool saved = false;
     float x = 0, y = 0, z = 0, psi = 0, the = 0, fov = 0;
     XPLMHotKeyID hotkey = nullptr;
@@ -122,18 +123,21 @@ static std::string keyName(int vk, int fl) {
 // ---------------------------------------------------------------- persistance
 
 static void buildCfgPath() {
-    char fname[256] = {0}, fpath[1024] = {0};
-    XPLMGetNthAircraftModel(0, fname, fpath);
-    XPLMExtractFileAndPath(fpath);  // fpath devient le dossier de l'avion
-    std::string sep = XPLMGetDirectorySeparator();
-    gCfgPath = std::string(fpath) + sep + "plugins" + sep + "FCC" + sep + "cameras.cfg";
+    // cameras.cfg est range a cote du dossier 64/ du plugin, quel que soit le nom du dossier
+    char path[1024] = {0};
+    XPLMGetPluginInfo(XPLMGetMyID(), nullptr, path, nullptr, nullptr);
+    XPLMExtractFileAndPath(path);  // path = dossier du .xpl (.../SFC/64)
+    std::string dir = path;
+    size_t p = dir.find_last_of("/\\");
+    if (p != std::string::npos) dir = dir.substr(0, p);  // .../SFC
+    gCfgPath = dir + XPLMGetDirectorySeparator() + "cameras.cfg";
 }
 
 static void saveConfig() {
     if (gCfgPath.empty()) return;
     std::ofstream f(gCfgPath, std::ios::trunc);
     if (!f) {
-        XPLMDebugString("FCC: impossible d'ecrire cameras.cfg\n");
+        XPLMDebugString("SFC: impossible d'ecrire cameras.cfg\n");
         return;
     }
     f << "S|" << (gSmooth ? 1 : 0) << '\n';
@@ -142,7 +146,7 @@ static void saveConfig() {
         std::string n = s.name;
         std::replace(n.begin(), n.end(), '|', ' ');
         f << i << '|' << n << '|' << s.vk << '|' << s.kflags << '|' << (s.saved ? 1 : 0) << '|' << s.x
-          << '|' << s.y << '|' << s.z << '|' << s.psi << '|' << s.the << '|' << s.fov << '\n';
+          << '|' << s.y << '|' << s.z << '|' << s.psi << '|' << s.the << '|' << s.fov << '|' << (s.enabled ? 1 : 0) << '\n';
     }
 }
 
@@ -151,6 +155,7 @@ static void loadConfig() {
         gSlots[i].name = "Camera " + std::to_string(i + 1);
         gSlots[i].vk = 0;
         gSlots[i].kflags = 0;
+        gSlots[i].enabled = true;
         gSlots[i].saved = false;
     }
     std::ifstream f(gCfgPath);
@@ -165,7 +170,8 @@ static void loadConfig() {
         std::stringstream ss(line);
         std::string t;
         while (std::getline(ss, t, '|')) p.push_back(t);
-        while (p.size() < 11) p.push_back("0");
+        bool hasEnabled = p.size() >= 12;
+        while (p.size() < 12) p.push_back("0");
         int i = atoi(p[0].c_str());
         if (i < 0 || i >= N_SLOTS) continue;
         Slot& s = gSlots[i];
@@ -179,6 +185,7 @@ static void loadConfig() {
         s.psi = (float)atof(p[8].c_str());
         s.the = (float)atof(p[9].c_str());
         s.fov = (float)atof(p[10].c_str());
+        s.enabled = hasEnabled ? (atoi(p[11].c_str()) != 0) : true;
     }
 }
 
@@ -260,7 +267,7 @@ static float loopCb(float, float, int, void*) {
 static void recallCamera(int i) {
     Slot& s = gSlots[i];
     char dbg[128];
-    snprintf(dbg, sizeof dbg, "FCC: recall camera %d (saved=%d)\n", i + 1, s.saved ? 1 : 0);
+    snprintf(dbg, sizeof dbg, "SFC: recall camera %d (saved=%d)\n", i + 1, s.saved ? 1 : 0);
     XPLMDebugString(dbg);
     if (!s.saved) {
         setStatus("Camera " + std::to_string(i + 1) + " is empty - click SAVE first");
@@ -306,8 +313,8 @@ static void registerHotkeys() {
             XPLMUnregisterHotKey(s.hotkey);
             s.hotkey = nullptr;
         }
-        if (s.vk) {
-            std::string d = "FCC " + s.name;
+        if (s.vk && s.enabled) {
+            std::string d = "SFC " + s.name;
             s.hotkey = XPLMRegisterHotKey((char)s.vk, xplm_DownFlag | s.kflags, d.c_str(), hotkeyCb,
                                           (void*)(intptr_t)i);
         }
@@ -329,11 +336,13 @@ static int cmdHandler(XPLMCommandRef, XPLMCommandPhase phase, void* refcon) {
 struct Cell { int l, b, r, t; };
 
 static Cell cellBadge(int wl, int wt, int i) { int t = wt - TITLE_H - HEAD_H - i * ROW_H - 4; return {wl + 12, t - 26, wl + 38, t}; }
-static Cell cellName(int wl, int wt, int i)  { int t = wt - TITLE_H - HEAD_H - i * ROW_H - 4; return {wl + 46, t - 26, wl + 226, t}; }
-static Cell cellKey(int wl, int wt, int i)   { int t = wt - TITLE_H - HEAD_H - i * ROW_H - 4; return {wl + 234, t - 26, wl + 374, t}; }
-static Cell cellSave(int wl, int wt, int i)  { int t = wt - TITLE_H - HEAD_H - i * ROW_H - 4; return {wl + 382, t - 26, wl + 468, t}; }
+static Cell cellName(int wl, int wt, int i)  { int t = wt - TITLE_H - HEAD_H - i * ROW_H - 4; return {wl + 46, t - 26, wl + 204, t}; }
+static Cell cellKey(int wl, int wt, int i)   { int t = wt - TITLE_H - HEAD_H - i * ROW_H - 4; return {wl + 212, t - 26, wl + 342, t}; }
+static Cell cellToggle(int wl, int wt, int i) { int t = wt - TITLE_H - HEAD_H - i * ROW_H - 4; return {wl + 346, t - 26, wl + 378, t}; }
+static Cell cellClear(int wl, int wt, int i)  { int t = wt - TITLE_H - HEAD_H - i * ROW_H - 4; return {wl + 382, t - 26, wl + 404, t}; }
+static Cell cellSave(int wl, int wt, int i)  { int t = wt - TITLE_H - HEAD_H - i * ROW_H - 4; return {wl + 410, t - 26, wl + 468, t}; }
 static Cell cellClose(int wl, int wt)        { return {wl + WIN_W - 32, wt - 30, wl + WIN_W - 8, wt - 8}; }
-static Cell cellSmooth(int wl, int wt)       { return {wl + WIN_W - 142, wt - 30, wl + WIN_W - 40, wt - 8}; }
+static Cell cellSmooth(int wl, int wb)       { return {wl + WIN_W - 110, wb + 8, wl + WIN_W - 14, wb + 30}; }
 
 static bool ptIn(const Cell& c, int x, int y) { return x >= c.l && x <= c.r && y >= c.b && y <= c.t; }
 
@@ -349,6 +358,8 @@ static const float C_BLUEHOV[4]  = {0.25f, 0.55f, 0.95f, 1.0f};
 static const float C_GREEN[4]    = {0.19f, 0.70f, 0.40f, 1.0f};
 static const float C_GREY[4]     = {0.30f, 0.32f, 0.37f, 1.0f};
 static const float C_REDHOV[4]   = {0.85f, 0.25f, 0.25f, 1.0f};
+static const float C_WHITE4[4]   = {0.93f, 0.94f, 0.96f, 1.0f};
+static const float C_BORDER[4]   = {0.30f, 0.33f, 0.40f, 1.0f};
 static const float C_WHITE[3]    = {0.93f, 0.94f, 0.96f};
 static const float C_DIM[3]      = {0.58f, 0.61f, 0.67f};
 static const float C_DARK[3]     = {0.05f, 0.06f, 0.08f};
@@ -403,23 +414,26 @@ static void drawCb(XPLMWindowID w, void*) {
 
     // barre de titre
     rect(wl, wt - TITLE_H, wl + WIN_W, wt, C_TITLE);
-    rect(wl, wt - TITLE_H, wl + 5, wt, C_ACCENT);
-    text(wl + 16, wt - 24, "FCC", C_AMBER);
-    text(wl + 52, wt - 24, "Falcon Cockpit Camera", C_WHITE);
+    rect(wl, wt - TITLE_H, wl + WIN_W, wt - TITLE_H + 2, C_ACCENT);  // liseré ambre sous le titre
+    {
+        // titre centre : "SFC" en ambre + nom complet en blanc
+        const std::string t1 = "SFC", t2 = "  -  Simple Falcon Camera";
+        float w1 = XPLMMeasureString(xplmFont_Proportional, t1.c_str(), (int)t1.size());
+        float w2 = XPLMMeasureString(xplmFont_Proportional, t2.c_str(), (int)t2.size());
+        int x0 = (int)(wl + WIN_W / 2.0f - (w1 + w2) / 2.0f);
+        text(x0, wt - 22, t1, C_AMBER);
+        text(x0 + (int)w1, wt - 22, t2, C_WHITE);
+    }
 
     Cell cl = cellClose(wl, wt);
     rect(cl.l, cl.b, cl.r, cl.t, hovered(cl, now) ? C_REDHOV : C_CELL);
     textCentered(cl, "X", C_WHITE);
 
-    Cell cm = cellSmooth(wl, wt);
-    rect(cm.l, cm.b, cm.r, cm.t, hovered(cm, now) ? C_CELLHOV : C_CELL);
-    textCentered(cm, gSmooth ? "Smooth: ON" : "Smooth: OFF", gSmooth ? C_AMBER : C_DIM);
-
     // en-tetes de colonnes
     int hy = wt - TITLE_H - 16;
-    text(wl + 18, hy, "#", C_DIM);
-    text(wl + 50, hy, "NAME", C_DIM);
-    text(wl + 238, hy, "KEYBIND", C_DIM);
+    { Cell h = cellBadge(wl, wt, 0); h.b = hy - 9; textCentered(h, "#", C_DIM); }
+    { Cell h = cellName(wl, wt, 0);  h.b = hy - 9; textCentered(h, "NAME", C_DIM); }
+    { Cell h = cellKey(wl, wt, 0);   h.b = hy - 9; textCentered(h, "KEYBIND", C_DIM); }
 
     // lignes
     for (int i = 0; i < N_SLOTS; ++i) {
@@ -435,7 +449,7 @@ static void drawCb(XPLMWindowID w, void*) {
         // nom (editable)
         bool editing = (gEdit == i);
         rect(cn.l, cn.b, cn.r, cn.t, editing ? C_CELLHOV : (hovered(cn, now) ? C_CELLHOV : C_CELL));
-        if (editing) outline(cn.l, cn.b, cn.r, cn.t, C_ACCENT);
+        outline(cn.l, cn.b, cn.r, cn.t, editing ? C_ACCENT : C_BORDER);
         std::string nm = s.name;
         if (editing && ((int)(now * 2.0f) % 2 == 0)) nm += "|";
         text(cn.l + 8, cn.b + 9, nm, C_WHITE);
@@ -443,12 +457,24 @@ static void drawCb(XPLMWindowID w, void*) {
         // keybind
         bool waiting = (gCapture == i);
         rect(ck.l, ck.b, ck.r, ck.t, waiting ? C_ACCENT : (hovered(ck, now) ? C_CELLHOV : C_CELL));
+        outline(ck.l, ck.b, ck.r, ck.t, waiting ? C_ACCENT : C_BORDER);
         if (waiting) {
             textCentered(ck, "Waiting for keybind...", C_DARK);
         } else if (s.vk) {
-            textCentered(ck, keyName(s.vk, s.kflags), C_WHITE);
+            textCentered(ck, keyName(s.vk, s.kflags), s.enabled ? C_WHITE : C_DIM);
         } else {
             textCentered(ck, "Click to bind", C_DIM);
+        }
+
+        // ON/OFF (desactiver sans supprimer) et X (supprimer) : seulement si un keybind existe
+        if (s.vk) {
+            Cell ct = cellToggle(wl, wt, i), cx = cellClear(wl, wt, i);
+            const float* tc = s.enabled ? C_GREEN : C_GREY;
+            rect(ct.l, ct.b, ct.r, ct.t, tc);
+            if (hovered(ct, now)) outline(ct.l, ct.b, ct.r, ct.t, C_WHITE4);
+            textCentered(ct, s.enabled ? "ON" : "OFF", s.enabled ? C_DARK : C_WHITE);
+            rect(cx.l, cx.b, cx.r, cx.t, hovered(cx, now) ? C_REDHOV : C_CELL);
+            textCentered(cx, "X", C_WHITE);
         }
 
         // SAVE
@@ -461,8 +487,13 @@ static void drawCb(XPLMWindowID w, void*) {
     // pied de page
     int fy = wb + FOOT_H;
     rect(wl, wb, wl + WIN_W, fy - 4, C_TITLE);
-    text(wl + 14, wb + 32, "Click a keybind, then press a key.  Esc = cancel   Backspace = clear", C_DIM);
+    text(wl + 14, wb + 32, "Click a keybind, then press a key.  Esc = cancel  |  X or right-click = remove", C_DIM);
     text(wl + 14, wb + 12, gStatusMsg.empty() ? "Ready" : gStatusMsg, C_AMBER);
+
+    Cell cm = cellSmooth(wl, wb);
+    rect(cm.l, cm.b, cm.r, cm.t, hovered(cm, now) ? C_CELLHOV : C_CELL);
+    outline(cm.l, cm.b, cm.r, cm.t, C_BORDER);
+    textCentered(cm, gSmooth ? "Smooth: ON" : "Smooth: OFF", gSmooth ? C_AMBER : C_DIM);
 }
 
 // ---------------------------------------------------------------- entrees
@@ -477,6 +508,15 @@ static void cancelInput() {
     XPLMTakeKeyboardFocus(0);
 }
 
+static void clearKey(int i) {
+    gSlots[i].vk = 0;
+    gSlots[i].kflags = 0;
+    gSlots[i].enabled = true;
+    registerHotkeys();
+    saveConfig();
+    setStatus("Keybind removed for camera " + std::to_string(i + 1));
+}
+
 static int mouseCb(XPLMWindowID w, int x, int y, XPLMMouseStatus st, void*) {
     int wl, wt, wr, wb;
     XPLMGetWindowGeometry(w, &wl, &wt, &wr, &wb);
@@ -487,7 +527,7 @@ static int mouseCb(XPLMWindowID w, int x, int y, XPLMMouseStatus st, void*) {
             XPLMSetWindowIsVisible(w, 0);
             return 1;
         }
-        if (ptIn(cellSmooth(wl, wt), x, y)) {
+        if (ptIn(cellSmooth(wl, wb), x, y)) {
             gSmooth = !gSmooth;
             saveConfig();
             setStatus(gSmooth ? "Smooth transition enabled" : "Smooth transition disabled");
@@ -503,6 +543,20 @@ static int mouseCb(XPLMWindowID w, int x, int y, XPLMMouseStatus st, void*) {
             if (ptIn(cellSave(wl, wt, i), x, y)) {
                 cancelInput();
                 saveCamera(i);
+                return 1;
+            }
+            if (gSlots[i].vk && ptIn(cellToggle(wl, wt, i), x, y)) {
+                cancelInput();
+                gSlots[i].enabled = !gSlots[i].enabled;
+                registerHotkeys();
+                saveConfig();
+                setStatus("Camera " + std::to_string(i + 1) + " keybind " +
+                          (gSlots[i].enabled ? "enabled" : "disabled"));
+                return 1;
+            }
+            if (gSlots[i].vk && ptIn(cellClear(wl, wt, i), x, y)) {
+                cancelInput();
+                clearKey(i);
                 return 1;
             }
             if (ptIn(cellKey(wl, wt, i), x, y)) {
@@ -532,7 +586,19 @@ static int mouseCb(XPLMWindowID w, int x, int y, XPLMMouseStatus st, void*) {
     return 1;
 }
 
-static int rightClickCb(XPLMWindowID, int, int, XPLMMouseStatus, void*) { return 1; }
+static int rightClickCb(XPLMWindowID w, int x, int y, XPLMMouseStatus st, void*) {
+    if (st == xplm_MouseDown) {
+        int wl, wt, wr, wb;
+        XPLMGetWindowGeometry(w, &wl, &wt, &wr, &wb);
+        for (int i = 0; i < N_SLOTS; ++i)
+            if (gSlots[i].vk && ptIn(cellKey(wl, wt, i), x, y)) {
+                cancelInput();
+                clearKey(i);
+                break;
+            }
+    }
+    return 1;
+}
 static int wheelCb(XPLMWindowID, int, int, int, int, void*) { return 1; }
 static XPLMCursorStatus cursorCb(XPLMWindowID, int x, int y, void*) {
     gMX = x;
@@ -636,8 +702,8 @@ static void menuHandler(void*, void*) { showWindow(); }
 // ---------------------------------------------------------------- cycle de vie
 
 PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
-    strcpy(outName, "FCC - Falcon Cockpit Camera");
-    strcpy(outSig, "fr.jb.fcc");
+    strcpy(outName, "SFC - Simple Falcon Camera");
+    strcpy(outSig, "fr.jb.sfc");
     strcpy(outDesc, "Sauvegarde et rappel de positions de camera cockpit avec raccourcis clavier.");
 
     XPLMEnableFeature("XPLM_USE_NATIVE_PATHS", 1);
@@ -653,8 +719,8 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
 
     for (int i = 0; i < N_SLOTS; ++i) {
         std::string n = std::to_string(i + 1);
-        std::string rn = "FCC/recall_" + n, sn = "FCC/save_" + n;
-        std::string rd = "FCC : aller a la camera " + n, sd = "FCC : sauvegarder la camera " + n;
+        std::string rn = "SFC/recall_" + n, sn = "SFC/save_" + n;
+        std::string rd = "SFC : aller a la camera " + n, sd = "SFC : sauvegarder la camera " + n;
         XPLMCommandRef rc = XPLMCreateCommand(rn.c_str(), rd.c_str());
         XPLMCommandRef sc = XPLMCreateCommand(sn.c_str(), sd.c_str());
         XPLMRegisterCommandHandler(rc, cmdHandler, 1, (void*)(intptr_t)(i * 2));
@@ -668,8 +734,8 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
     fl.refcon = nullptr;
     gLoop = XPLMCreateFlightLoop(&fl);
 
-    int item = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "FCC", nullptr, 1);
-    gMenu = XPLMCreateMenu("FCC", XPLMFindPluginsMenu(), item, menuHandler, nullptr);
+    int item = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "SFC", nullptr, 1);
+    gMenu = XPLMCreateMenu("SFC", XPLMFindPluginsMenu(), item, menuHandler, nullptr);
     XPLMAppendMenuItem(gMenu, "Open window", (void*)1, 1);
     return 1;
 }

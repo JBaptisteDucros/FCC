@@ -1,4 +1,4 @@
-name: Build FCC
+name: Build SFC
 
 on:
   push:
@@ -26,8 +26,8 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: FCC-${{ matrix.os }}
-          path: dist/FCC/64/*
+          name: SFC-${{ matrix.os }}
+          path: dist/SFC/64/*
 
   package:
     needs: build
@@ -35,11 +35,11 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: FCC-*
+          pattern: SFC-*
           merge-multiple: true
-          path: FCC/64
+          path: SFC/64
 
       - uses: actions/upload-artifact@v4
         with:
-          name: FCC
-          path: FCC
+          name: SFC
+          path: SFC
