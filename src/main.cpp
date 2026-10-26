@@ -37,7 +37,7 @@
 #include "XPLMPlugin.h"
 #include "XPLMProcessing.h"
 
-static const int N_SLOTS = 8;
+static const int N_SLOTS = 9;
 static const int WIN_W = 480;
 static const int TITLE_H = 36;
 static const int HEAD_H = 22;
@@ -65,6 +65,10 @@ static int gPending = -1;
 
 // transition douce entre deux vues
 static bool gSmooth = true;
+
+// opacite de la fenetre (4 niveaux, cliquer sur le bouton Opacity pour changer)
+static const float OPACITY_LEVELS[4] = {1.0f, 0.75f, 0.5f, 0.25f};
+static int gOpacity = 0;
 static const float ANIM_DUR = 0.6f;  // secondes
 struct Anim {
     bool active = false;
@@ -141,6 +145,7 @@ static void saveConfig() {
         return;
     }
     f << "S|" << (gSmooth ? 1 : 0) << '\n';
+    f << "O|" << gOpacity << '\n';
     for (int i = 0; i < N_SLOTS; ++i) {
         Slot& s = gSlots[i];
         std::string n = s.name;
@@ -164,6 +169,11 @@ static void loadConfig() {
     while (std::getline(f, line)) {
         if (line.size() > 1 && line[0] == 'S' && line[1] == '|') {
             gSmooth = atoi(line.c_str() + 2) != 0;
+            continue;
+        }
+        if (line.size() > 1 && line[0] == 'O' && line[1] == '|') {
+            int o = atoi(line.c_str() + 2);
+            gOpacity = (o >= 0 && o < 4) ? o : 0;
             continue;
         }
         std::vector<std::string> p;
@@ -342,7 +352,8 @@ static Cell cellToggle(int wl, int wt, int i) { int t = wt - TITLE_H - HEAD_H - 
 static Cell cellClear(int wl, int wt, int i)  { int t = wt - TITLE_H - HEAD_H - i * ROW_H - 4; return {wl + 382, t - 26, wl + 404, t}; }
 static Cell cellSave(int wl, int wt, int i)  { int t = wt - TITLE_H - HEAD_H - i * ROW_H - 4; return {wl + 410, t - 26, wl + 468, t}; }
 static Cell cellClose(int wl, int wt)        { return {wl + WIN_W - 32, wt - 30, wl + WIN_W - 8, wt - 8}; }
-static Cell cellSmooth(int wl, int wb)       { return {wl + WIN_W - 110, wb + 8, wl + WIN_W - 14, wb + 30}; }
+static Cell cellSmooth(int wl, int wt)       { return {wl + WIN_W - 142, wt - 30, wl + WIN_W - 40, wt - 8}; }
+static Cell cellOpacity(int wl, int wt)      { return {wl + 10, wt - 30, wl + 124, wt - 8}; }
 
 static bool ptIn(const Cell& c, int x, int y) { return x >= c.l && x <= c.r && y >= c.b && y <= c.t; }
 
@@ -367,7 +378,7 @@ static const float C_AMBER[3]    = {0.96f, 0.64f, 0.14f};
 
 static void rect(int l, int b, int r, int t, const float* c) {
     XPLMSetGraphicsState(0, 0, 0, 0, 1, 0, 0);
-    glColor4f(c[0], c[1], c[2], c[3]);
+    glColor4f(c[0], c[1], c[2], c[3] * OPACITY_LEVELS[gOpacity]);
     // Les polygones pleins (quads / triangles) ne sont pas rendus par la couche de compatibilite
     // OpenGL d'X-Plane 12, alors que les lignes le sont : on remplit en lignes horizontales.
     glLineWidth(1.0f);
@@ -408,7 +419,7 @@ static void drawCb(XPLMWindowID w, void*) {
     float now = XPLMGetElapsedTime();
 
     // fond sombre natif d'X-Plane (toujours rendu), puis nos aplats par-dessus
-    XPLMDrawTranslucentDarkBox(wl, wt, wl + WIN_W, wb);
+    if (gOpacity == 0) XPLMDrawTranslucentDarkBox(wl, wt, wl + WIN_W, wb);
     rect(wl, wb, wl + WIN_W, wt, C_BG);
     outline(wl, wb, wl + WIN_W, wt, C_GREY);
 
@@ -420,7 +431,7 @@ static void drawCb(XPLMWindowID w, void*) {
         const std::string t1 = "SFC", t2 = "  -  Simple Falcon Camera";
         float w1 = XPLMMeasureString(xplmFont_Proportional, t1.c_str(), (int)t1.size());
         float w2 = XPLMMeasureString(xplmFont_Proportional, t2.c_str(), (int)t2.size());
-        int x0 = (int)(wl + WIN_W / 2.0f - (w1 + w2) / 2.0f);
+        int x0 = (int)(wl + WIN_W / 2.0f - (w1 + w2) / 2.0f) - 12;  // decale legerement a gauche
         text(x0, wt - 22, t1, C_AMBER);
         text(x0 + (int)w1, wt - 22, t2, C_WHITE);
     }
@@ -428,6 +439,18 @@ static void drawCb(XPLMWindowID w, void*) {
     Cell cl = cellClose(wl, wt);
     rect(cl.l, cl.b, cl.r, cl.t, hovered(cl, now) ? C_REDHOV : C_CELL);
     textCentered(cl, "X", C_WHITE);
+
+    // boutons du bandeau : Opacity (a gauche) et Smooth (a droite)
+    Cell co = cellOpacity(wl, wt);
+    rect(co.l, co.b, co.r, co.t, hovered(co, now) ? C_CELLHOV : C_CELL);
+    outline(co.l, co.b, co.r, co.t, C_BORDER);
+    textCentered(co, "Opacity: " + std::to_string((int)(OPACITY_LEVELS[gOpacity] * 100.0f + 0.5f)) + "%",
+                 gOpacity == 0 ? C_WHITE : C_AMBER);
+
+    Cell cm = cellSmooth(wl, wt);
+    rect(cm.l, cm.b, cm.r, cm.t, hovered(cm, now) ? C_CELLHOV : C_CELL);
+    outline(cm.l, cm.b, cm.r, cm.t, C_BORDER);
+    textCentered(cm, gSmooth ? "Smooth: ON" : "Smooth: OFF", gSmooth ? C_AMBER : C_DIM);
 
     // en-tetes de colonnes
     int hy = wt - TITLE_H - 16;
@@ -488,13 +511,7 @@ static void drawCb(XPLMWindowID w, void*) {
     int fy = wb + FOOT_H;
     rect(wl, wb, wl + WIN_W, fy - 4, C_TITLE);
     text(wl + 14, wb + 32, "Click a keybind, then press a key.  Esc = cancel  |  X or right-click = remove", C_DIM);
-    text(wl + 14, wb + 12, gStatusMsg.empty() ? "Ready" : gStatusMsg, C_AMBER);
-
-    Cell cm = cellSmooth(wl, wb);
-    rect(cm.l, cm.b, cm.r, cm.t, hovered(cm, now) ? C_CELLHOV : C_CELL);
-    outline(cm.l, cm.b, cm.r, cm.t, C_BORDER);
-    textCentered(cm, gSmooth ? "Smooth: ON" : "Smooth: OFF", gSmooth ? C_AMBER : C_DIM);
-}
+    text(wl + 14, wb + 12, gStatusMsg.empty() ? "Ready" : gStatusMsg, C_AMBER);}
 
 // ---------------------------------------------------------------- entrees
 
@@ -527,7 +544,13 @@ static int mouseCb(XPLMWindowID w, int x, int y, XPLMMouseStatus st, void*) {
             XPLMSetWindowIsVisible(w, 0);
             return 1;
         }
-        if (ptIn(cellSmooth(wl, wb), x, y)) {
+        if (ptIn(cellOpacity(wl, wt), x, y)) {
+            gOpacity = (gOpacity + 1) % 4;
+            saveConfig();
+            setStatus("Window opacity: " + std::to_string((int)(OPACITY_LEVELS[gOpacity] * 100.0f + 0.5f)) + "%");
+            return 1;
+        }
+        if (ptIn(cellSmooth(wl, wt), x, y)) {
             gSmooth = !gSmooth;
             saveConfig();
             setStatus(gSmooth ? "Smooth transition enabled" : "Smooth transition disabled");
