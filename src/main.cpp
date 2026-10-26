@@ -28,6 +28,7 @@
 #endif
 
 #include "XPLMDefs.h"
+#include "XPLMCamera.h"
 #include "XPLMUtilities.h"
 #include "XPLMDataAccess.h"
 #include "XPLMDisplay.h"
@@ -50,17 +51,33 @@ struct Slot {
     int vk = 0;               // 0 = pas de keybind
     int kflags = 0;           // modificateurs (Shift / Ctrl / Alt)
     bool enabled = true;      // keybind actif ou desactive (sans etre supprime)
+    int joy = -1;             // bouton de joystick (index X-Plane), -1 = aucun
+    int mode = 0;             // 0 = vue cockpit (tete du pilote), 1 = vue exterieure (camera relative a l'avion)
+    float rx = 0, ry = 0, rz = 0, rh = 0, rp = 0, rr = 0, rzoom = 1;  // vue exterieure
     bool saved = false;
     float x = 0, y = 0, z = 0, psi = 0, the = 0, fov = 0;
     XPLMHotKeyID hotkey = nullptr;
 };
 
 static Slot gSlots[N_SLOTS];
+static bool hasBind(const Slot& s) { return s.vk != 0 || s.joy >= 0; }
 static std::string gCfgPath;
 
 static XPLMDataRef drX, drY, drZ, drPsi, drThe, drFov, drViewType;
 static XPLMCommandRef cmdLook3D;
 static XPLMFlightLoopID gLoop = nullptr;
+
+// joystick : lecture de l'etat des boutons a chaque frame (detection des appuis)
+static XPLMDataRef drJoyBtn = nullptr;
+static XPLMFlightLoopID gJoyLoop = nullptr;
+static std::vector<int> gJoyPrev;
+
+// vues exterieures (API camera) : SFC garde la main sur la camera jusqu'au changement de vue
+static XPLMDataRef drLocX, drLocY, drLocZ, drPlanePsi;
+static bool gCamActive = false;
+static int gExtSlot = -1;
+static float gExtT0 = 0.0f;
+static XPLMCameraPosition_t gExtFrom;
 static int gPending = -1;
 
 // transition douce entre deux vues
@@ -124,6 +141,11 @@ static std::string keyName(int vk, int fl) {
     return s;
 }
 
+static std::string bindName(const Slot& s) {
+    if (s.joy >= 0) return "Joy Btn " + std::to_string(s.joy);
+    return keyName(s.vk, s.kflags);
+}
+
 // ---------------------------------------------------------------- persistance
 
 static void buildCfgPath() {
@@ -151,7 +173,8 @@ static void saveConfig() {
         std::string n = s.name;
         std::replace(n.begin(), n.end(), '|', ' ');
         f << i << '|' << n << '|' << s.vk << '|' << s.kflags << '|' << (s.saved ? 1 : 0) << '|' << s.x
-          << '|' << s.y << '|' << s.z << '|' << s.psi << '|' << s.the << '|' << s.fov << '|' << (s.enabled ? 1 : 0) << '\n';
+          << '|' << s.y << '|' << s.z << '|' << s.psi << '|' << s.the << '|' << s.fov << '|' << (s.enabled ? 1 : 0) << '|' << s.joy << '|' << s.mode << '|' << s.rx << '|' << s.ry
+          << '|' << s.rz << '|' << s.rh << '|' << s.rp << '|' << s.rr << '|' << s.rzoom << '\n';
     }
 }
 
@@ -161,6 +184,8 @@ static void loadConfig() {
         gSlots[i].vk = 0;
         gSlots[i].kflags = 0;
         gSlots[i].enabled = true;
+        gSlots[i].joy = -1;
+        gSlots[i].mode = 0;
         gSlots[i].saved = false;
     }
     std::ifstream f(gCfgPath);
@@ -181,7 +206,9 @@ static void loadConfig() {
         std::string t;
         while (std::getline(ss, t, '|')) p.push_back(t);
         bool hasEnabled = p.size() >= 12;
-        while (p.size() < 12) p.push_back("0");
+        bool hasJoy = p.size() >= 13;
+        bool hasExt = p.size() >= 21;
+        while (p.size() < 21) p.push_back("0");
         int i = atoi(p[0].c_str());
         if (i < 0 || i >= N_SLOTS) continue;
         Slot& s = gSlots[i];
@@ -196,6 +223,15 @@ static void loadConfig() {
         s.the = (float)atof(p[9].c_str());
         s.fov = (float)atof(p[10].c_str());
         s.enabled = hasEnabled ? (atoi(p[11].c_str()) != 0) : true;
+        s.joy = hasJoy ? atoi(p[12].c_str()) : -1;
+        s.mode = hasExt ? atoi(p[13].c_str()) : 0;
+        s.rx = (float)atof(p[14].c_str());
+        s.ry = (float)atof(p[15].c_str());
+        s.rz = (float)atof(p[16].c_str());
+        s.rh = (float)atof(p[17].c_str());
+        s.rp = (float)atof(p[18].c_str());
+        s.rr = (float)atof(p[19].c_str());
+        s.rzoom = hasExt ? (float)atof(p[20].c_str()) : 1.0f;
     }
 }
 
@@ -274,6 +310,82 @@ static float loopCb(float, float, int, void*) {
     return gAnim.active ? -1.0f : 0.0f;  // -1 = a chaque frame
 }
 
+// ---- vues exterieures : la camera est memorisee relativement a l'avion (droite / haut / avant)
+static const double DEG2RAD = 3.14159265358979323846 / 180.0;
+
+static float normAngle180(float a) {
+    while (a > 180.0f) a -= 360.0f;
+    while (a < -180.0f) a += 360.0f;
+    return a;
+}
+
+static float easeCubic(float t) {
+    return (t < 0.5f) ? 4.0f * t * t * t : 1.0f - powf(-2.0f * t + 2.0f, 3.0f) / 2.0f;
+}
+
+static void worldToRel(const XPLMCameraPosition_t& c, Slot& s) {
+    double ax = XPLMGetDatad(drLocX), ay = XPLMGetDatad(drLocY), az = XPLMGetDatad(drLocZ);
+    float psiDeg = XPLMGetDataf(drPlanePsi);
+    double psi = psiDeg * DEG2RAD;
+    double dx = c.x - ax, dy = c.y - ay, dz = c.z - az;
+    s.rx = (float)(dx * cos(psi) + dz * sin(psi));  // a droite de l'avion
+    s.ry = (float)dy;                               // au-dessus
+    s.rz = (float)(dx * sin(psi) - dz * cos(psi));  // devant
+    s.rh = normAngle180(c.heading - psiDeg);
+    s.rp = c.pitch;
+    s.rr = c.roll;
+    s.rzoom = c.zoom;
+}
+
+static XPLMCameraPosition_t relToWorld(const Slot& s) {
+    double ax = XPLMGetDatad(drLocX), ay = XPLMGetDatad(drLocY), az = XPLMGetDatad(drLocZ);
+    float psiDeg = XPLMGetDataf(drPlanePsi);
+    double psi = psiDeg * DEG2RAD;
+    XPLMCameraPosition_t c;
+    c.x = (float)(ax + s.rx * cos(psi) + s.rz * sin(psi));
+    c.y = (float)(ay + s.ry);
+    c.z = (float)(az + s.rx * sin(psi) - s.rz * cos(psi));
+    c.heading = s.rh + psiDeg;
+    c.pitch = s.rp;
+    c.roll = s.rr;
+    c.zoom = (s.rzoom > 0.01f) ? s.rzoom : 1.0f;
+    return c;
+}
+
+// appelee a chaque frame tant que SFC controle la camera
+static int camCb(XPLMCameraPosition_t* out, int losing, void*) {
+    if (losing || gExtSlot < 0) {
+        gCamActive = false;
+        return 0;
+    }
+    XPLMCameraPosition_t tg = relToWorld(gSlots[gExtSlot]);
+    float t = 1.0f;
+    if (gSmooth) {
+        t = (XPLMGetElapsedTime() - gExtT0) / ANIM_DUR;
+        if (t > 1.0f) t = 1.0f;
+        if (t < 0.0f) t = 0.0f;
+    }
+    float e = easeCubic(t);
+    const XPLMCameraPosition_t& f = gExtFrom;
+    out->x = f.x + (tg.x - f.x) * e;
+    out->y = f.y + (tg.y - f.y) * e;
+    out->z = f.z + (tg.z - f.z) * e;
+    out->pitch = f.pitch + (tg.pitch - f.pitch) * e;
+    out->heading = f.heading + normAngle180(tg.heading - f.heading) * e;
+    out->roll = f.roll + (tg.roll - f.roll) * e;
+    out->zoom = f.zoom + (tg.zoom - f.zoom) * e;
+    return 1;
+}
+
+static void beginExternal(int i) {
+    gAnim.active = false;  // stoppe une eventuelle animation de la tete
+    XPLMReadCameraPosition(&gExtFrom);
+    gExtSlot = i;
+    gExtT0 = XPLMGetElapsedTime();
+    XPLMControlCamera(xplm_ControlCameraUntilViewChanges, camCb, nullptr);
+    gCamActive = true;
+}
+
 static void recallCamera(int i) {
     Slot& s = gSlots[i];
     char dbg[128];
@@ -282,6 +394,15 @@ static void recallCamera(int i) {
     if (!s.saved) {
         setStatus("Camera " + std::to_string(i + 1) + " is empty - click SAVE first");
         return;
+    }
+    if (s.mode == 1) {
+        beginExternal(i);
+        setStatus("Moved to: " + s.name + " (external view)");
+        return;
+    }
+    if (gCamActive) {  // on quitte une vue exterieure geree par SFC
+        XPLMDontControlCamera();
+        gCamActive = false;
     }
     if (XPLMGetDatai(drViewType) != 1026) {
         // pas en cockpit 3D : on bascule, puis on applique a la frame suivante
@@ -296,17 +417,27 @@ static void recallCamera(int i) {
 
 static void saveCamera(int i) {
     Slot& s = gSlots[i];
-    s.x = XPLMGetDataf(drX);
-    s.y = XPLMGetDataf(drY);
-    s.z = XPLMGetDataf(drZ);
-    s.psi = XPLMGetDataf(drPsi);
-    s.the = XPLMGetDataf(drThe);
-    s.fov = XPLMGetDataf(drFov);
+    bool cockpit = (XPLMGetDatai(drViewType) == 1026) && !gCamActive;
+    if (cockpit) {
+        s.mode = 0;
+        s.x = XPLMGetDataf(drX);
+        s.y = XPLMGetDataf(drY);
+        s.z = XPLMGetDataf(drZ);
+        s.psi = XPLMGetDataf(drPsi);
+        s.the = XPLMGetDataf(drThe);
+        s.fov = XPLMGetDataf(drFov);
+    } else {
+        // vue exterieure (ou camera deja geree par SFC) : on lit la camera reelle
+        XPLMCameraPosition_t c;
+        XPLMReadCameraPosition(&c);
+        worldToRel(c, s);
+        s.mode = 1;
+    }
     s.saved = true;
     saveConfig();
     gFlashSlot = i;
     gFlashUntil = XPLMGetElapsedTime() + 1.2f;
-    setStatus("Camera " + std::to_string(i + 1) + " saved (" + s.name + ")");
+    setStatus("Camera " + std::to_string(i + 1) + " saved (" + s.name + (s.mode == 1 ? ", external view)" : ", cockpit view)"));
 }
 
 // ---------------------------------------------------------------- raccourcis
@@ -331,7 +462,50 @@ static void registerHotkeys() {
     }
 }
 
-// Commandes X-Plane : FCC/recall_N et FCC/save_N (bindables aussi dans Reglages > Clavier/Joystick)
+// Appui sur un bouton de joystick (front montant)
+static void onJoyPress(int btn) {
+    if (gCapture >= 0) {
+        int i = gCapture;
+        std::string moved;
+        for (int j = 0; j < N_SLOTS; ++j)
+            if (j != i && gSlots[j].joy == btn) {
+                gSlots[j].joy = -1;
+                moved = " (removed from camera " + std::to_string(j + 1) + ")";
+            }
+        gSlots[i].joy = btn;
+        gSlots[i].vk = 0;
+        gSlots[i].kflags = 0;
+        gSlots[i].enabled = true;
+        gCapture = -1;
+        XPLMTakeKeyboardFocus(0);
+        registerHotkeys();
+        saveConfig();
+        setStatus("Camera " + std::to_string(i + 1) + " bound to " + bindName(gSlots[i]) + moved);
+        return;
+    }
+    if (gEdit >= 0) return;
+    for (int i = 0; i < N_SLOTS; ++i)
+        if (gSlots[i].enabled && gSlots[i].joy == btn) recallCamera(i);
+}
+
+static float joyLoopCb(float, float, int, void*) {
+    if (!drJoyBtn) return -1.0f;
+    int n = XPLMGetDatavi(drJoyBtn, nullptr, 0, 0);
+    if (n <= 0) return -1.0f;
+    if (n > 3200) n = 3200;
+    std::vector<int> cur(n);
+    XPLMGetDatavi(drJoyBtn, cur.data(), 0, n);
+    if ((int)gJoyPrev.size() != n) {
+        gJoyPrev = cur;  // premiere lecture : on prend l'etat actuel comme reference
+        return -1.0f;
+    }
+    for (int i = 0; i < n; ++i)
+        if (cur[i] && !gJoyPrev[i]) onJoyPress(i);
+    gJoyPrev = cur;
+    return -1.0f;  // a chaque frame
+}
+
+// Commandes X-Plane : SFC/recall_N et SFC/save_N (bindables aussi dans Reglages > Clavier/Joystick)
 static int cmdHandler(XPLMCommandRef, XPLMCommandPhase phase, void* refcon) {
     if (phase != xplm_CommandBegin) return 1;
     int v = (int)(intptr_t)refcon;
@@ -483,14 +657,14 @@ static void drawCb(XPLMWindowID w, void*) {
         outline(ck.l, ck.b, ck.r, ck.t, waiting ? C_ACCENT : C_BORDER);
         if (waiting) {
             textCentered(ck, "Waiting for keybind...", C_DARK);
-        } else if (s.vk) {
-            textCentered(ck, keyName(s.vk, s.kflags), s.enabled ? C_WHITE : C_DIM);
+        } else if (hasBind(s)) {
+            textCentered(ck, bindName(s), s.enabled ? C_WHITE : C_DIM);
         } else {
             textCentered(ck, "Click to bind", C_DIM);
         }
 
         // ON/OFF (desactiver sans supprimer) et X (supprimer) : seulement si un keybind existe
-        if (s.vk) {
+        if (hasBind(s)) {
             Cell ct = cellToggle(wl, wt, i), cx = cellClear(wl, wt, i);
             const float* tc = s.enabled ? C_GREEN : C_GREY;
             rect(ct.l, ct.b, ct.r, ct.t, tc);
@@ -510,7 +684,7 @@ static void drawCb(XPLMWindowID w, void*) {
     // pied de page
     int fy = wb + FOOT_H;
     rect(wl, wb, wl + WIN_W, fy - 4, C_TITLE);
-    text(wl + 14, wb + 32, "Click a keybind, then press a key.  Esc = cancel  |  X or right-click = remove", C_DIM);
+    text(wl + 14, wb + 32, "Click a keybind, then press a key or joystick button  |  Esc = cancel", C_DIM);
     text(wl + 14, wb + 12, gStatusMsg.empty() ? "Ready" : gStatusMsg, C_AMBER);}
 
 // ---------------------------------------------------------------- entrees
@@ -526,6 +700,7 @@ static void cancelInput() {
 }
 
 static void clearKey(int i) {
+    gSlots[i].joy = -1;
     gSlots[i].vk = 0;
     gSlots[i].kflags = 0;
     gSlots[i].enabled = true;
@@ -568,7 +743,7 @@ static int mouseCb(XPLMWindowID w, int x, int y, XPLMMouseStatus st, void*) {
                 saveCamera(i);
                 return 1;
             }
-            if (gSlots[i].vk && ptIn(cellToggle(wl, wt, i), x, y)) {
+            if (hasBind(gSlots[i]) && ptIn(cellToggle(wl, wt, i), x, y)) {
                 cancelInput();
                 gSlots[i].enabled = !gSlots[i].enabled;
                 registerHotkeys();
@@ -577,7 +752,7 @@ static int mouseCb(XPLMWindowID w, int x, int y, XPLMMouseStatus st, void*) {
                           (gSlots[i].enabled ? "enabled" : "disabled"));
                 return 1;
             }
-            if (gSlots[i].vk && ptIn(cellClear(wl, wt, i), x, y)) {
+            if (hasBind(gSlots[i]) && ptIn(cellClear(wl, wt, i), x, y)) {
                 cancelInput();
                 clearKey(i);
                 return 1;
@@ -586,7 +761,7 @@ static int mouseCb(XPLMWindowID w, int x, int y, XPLMMouseStatus st, void*) {
                 cancelInput();
                 gCapture = i;
                 XPLMTakeKeyboardFocus(w);
-                setStatus("Press the key for camera " + std::to_string(i + 1));
+                setStatus("Press a key or a joystick button for camera " + std::to_string(i + 1));
                 return 1;
             }
             if (ptIn(cellName(wl, wt, i), x, y)) {
@@ -614,7 +789,7 @@ static int rightClickCb(XPLMWindowID w, int x, int y, XPLMMouseStatus st, void*)
         int wl, wt, wr, wb;
         XPLMGetWindowGeometry(w, &wl, &wt, &wr, &wb);
         for (int i = 0; i < N_SLOTS; ++i)
-            if (gSlots[i].vk && ptIn(cellKey(wl, wt, i), x, y)) {
+            if (hasBind(gSlots[i]) && ptIn(cellKey(wl, wt, i), x, y)) {
                 cancelInput();
                 clearKey(i);
                 break;
@@ -650,6 +825,7 @@ static void keyCb(XPLMWindowID, char key, XPLMKeyFlags flags, char vkey, void*, 
         } else if (vk == XPLM_VK_BACK || vk == XPLM_VK_DELETE) {
             gSlots[i].vk = 0;
             gSlots[i].kflags = 0;
+            gSlots[i].joy = -1;
             setStatus("Keybind cleared for camera " + std::to_string(i + 1));
         } else if (vk >= 0x10 && vk <= 0x12) {
             return;  // modificateur seul : on attend la vraie touche
@@ -664,6 +840,7 @@ static void keyCb(XPLMWindowID, char key, XPLMKeyFlags flags, char vkey, void*, 
                 }
             gSlots[i].vk = vk;
             gSlots[i].kflags = kf;
+            gSlots[i].joy = -1;
             setStatus("Camera " + std::to_string(i + 1) + " bound to " + keyName(vk, kf) + moved);
         }
         gCapture = -1;
@@ -739,6 +916,10 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
     drFov = XPLMFindDataRef("sim/graphics/view/field_of_view_deg");
     drViewType = XPLMFindDataRef("sim/graphics/view/view_type");
     cmdLook3D = XPLMFindCommand("sim/view/3d_cockpit_cmnd_look");
+    drLocX = XPLMFindDataRef("sim/flightmodel/position/local_x");
+    drLocY = XPLMFindDataRef("sim/flightmodel/position/local_y");
+    drLocZ = XPLMFindDataRef("sim/flightmodel/position/local_z");
+    drPlanePsi = XPLMFindDataRef("sim/flightmodel/position/psi");
 
     for (int i = 0; i < N_SLOTS; ++i) {
         std::string n = std::to_string(i + 1);
@@ -756,6 +937,10 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
     fl.callbackFunc = loopCb;
     fl.refcon = nullptr;
     gLoop = XPLMCreateFlightLoop(&fl);
+    fl.callbackFunc = joyLoopCb;
+    gJoyLoop = XPLMCreateFlightLoop(&fl);
+    drJoyBtn = XPLMFindDataRef("sim/joystick/joystick_button_values");
+    if (!drJoyBtn) XPLMDebugString("SFC: dataref sim/joystick/joystick_button_values introuvable\n");
 
     int item = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "SFC", nullptr, 1);
     gMenu = XPLMCreateMenu("SFC", XPLMFindPluginsMenu(), item, menuHandler, nullptr);
@@ -767,6 +952,8 @@ PLUGIN_API void XPluginStop(void) {
     for (int i = 0; i < N_SLOTS; ++i)
         if (gSlots[i].hotkey) XPLMUnregisterHotKey(gSlots[i].hotkey);
     if (gLoop) XPLMDestroyFlightLoop(gLoop);
+    if (gCamActive) XPLMDontControlCamera();
+    if (gJoyLoop) XPLMDestroyFlightLoop(gJoyLoop);
     if (gWin) XPLMDestroyWindow(gWin);
     if (gMenu) XPLMDestroyMenu(gMenu);
 }
@@ -775,9 +962,14 @@ PLUGIN_API int XPluginEnable(void) {
     buildCfgPath();
     loadConfig();
     registerHotkeys();
+    gJoyPrev.clear();
+    XPLMScheduleFlightLoop(gJoyLoop, -1.0f, 1);  // surveillance des boutons joystick, a chaque frame
     return 1;
 }
 
-PLUGIN_API void XPluginDisable(void) { saveConfig(); }
+PLUGIN_API void XPluginDisable(void) {
+    saveConfig();
+    if (gJoyLoop) XPLMScheduleFlightLoop(gJoyLoop, 0.0f, 1);  // 0 = desactive la boucle
+}
 
 PLUGIN_API void XPluginReceiveMessage(XPLMPluginID, int, void*) {}
