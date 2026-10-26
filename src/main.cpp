@@ -357,14 +357,14 @@ static const float C_AMBER[3]    = {0.96f, 0.64f, 0.14f};
 static void rect(int l, int b, int r, int t, const float* c) {
     XPLMSetGraphicsState(0, 0, 0, 0, 1, 0, 0);
     glColor4f(c[0], c[1], c[2], c[3]);
-    // GL_QUADS n'est pas supporte par la couche de compatibilite d'X-Plane 12 : triangles
-    glBegin(GL_TRIANGLES);
-    glVertex2f((float)l, (float)b);
-    glVertex2f((float)r, (float)b);
-    glVertex2f((float)r, (float)t);
-    glVertex2f((float)l, (float)b);
-    glVertex2f((float)r, (float)t);
-    glVertex2f((float)l, (float)t);
+    // Les polygones pleins (quads / triangles) ne sont pas rendus par la couche de compatibilite
+    // OpenGL d'X-Plane 12, alors que les lignes le sont : on remplit en lignes horizontales.
+    glLineWidth(1.0f);
+    glBegin(GL_LINES);
+    for (int yy = b; yy < t; ++yy) {
+        glVertex2f((float)l, (float)yy + 0.5f);
+        glVertex2f((float)r + 0.5f, (float)yy + 0.5f);
+    }
     glEnd();
 }
 
@@ -396,7 +396,8 @@ static void drawCb(XPLMWindowID w, void*) {
     XPLMGetWindowGeometry(w, &wl, &wt, &wr, &wb);
     float now = XPLMGetElapsedTime();
 
-    // fond + cadre
+    // fond sombre natif d'X-Plane (toujours rendu), puis nos aplats par-dessus
+    XPLMDrawTranslucentDarkBox(wl, wt, wl + WIN_W, wb);
     rect(wl, wb, wl + WIN_W, wt, C_BG);
     outline(wl, wb, wl + WIN_W, wt, C_GREY);
 
