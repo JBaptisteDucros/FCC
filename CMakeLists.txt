@@ -34,8 +34,9 @@ if(WIN32)
     set_target_properties(FCC PROPERTIES OUTPUT_NAME "win")
 elseif(APPLE)
     target_compile_definitions(FCC PRIVATE APL=1)
-    find_library(XPLM_FW XPLM PATHS ${XPLM_SDK}/Libraries/Mac NO_DEFAULT_PATH)
-    target_link_libraries(FCC ${XPLM_FW} "-framework OpenGL")
+    # Les symboles XPLM sont fournis par X-Plane au chargement : inutile de lier le framework
+    # du SDK (qui perd ses liens symboliques quand il passe par Windows/Git).
+    target_link_libraries(FCC "-framework OpenGL")
     target_compile_options(FCC PRIVATE -fvisibility=hidden)
     target_link_options(FCC PRIVATE -undefined dynamic_lookup)
     set_target_properties(FCC PROPERTIES OUTPUT_NAME "mac")
