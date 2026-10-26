@@ -1,0 +1,44 @@
+name: Build FCC
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenGL headers (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgl1-mesa-dev
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DXPLM_SDK="${{ github.workspace }}/SDK"
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FCC-${{ matrix.os }}
+          path: dist/FCC/64/*
+
+  package:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: FCC-*
+          merge-multiple: true
+          path: FCC/64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FCC
+          path: FCC
